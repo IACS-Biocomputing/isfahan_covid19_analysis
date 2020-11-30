@@ -1,0 +1,1092 @@
+---
+title: "COVID-19 Analyses"
+output: html_document
+---
+
+```{r setup, include=FALSE, cache = TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(haven)
+
+library(caret)
+library(pROC)
+```
+
+##  XGBoost exploration {.tabset}
+
+Train and test datasets created previoysly using `reateDataPartition(as.factor(Farvadin_2$Outcome), p=0.80, list=FALSE)`
+
+Train data (80%)
+
+```{r train data loading, cache = TRUE}
+dtrain_80 <- readRDS("Farvadin_2_train_80.Rda")  %>% 
+  mutate(Outcome = recode(Outcome, "0" = "ALIVE", "1" = "DEATH"))
+summary(dtrain_80$Outcome)
+```
+
+Test data (20%)
+
+```{r test data loading, warning = F, cache = TRUE}
+dtest_20 <- readRDS("Farvadin_2_test_20.Rda") %>% 
+  mutate(Outcome = recode(Outcome, "0" = "ALIVE", "1" = "DEATH"))
+summary(dtest_20$Outcome)
+```
+
+### Best Total model
+
+Independet variables:
+
+* `PT`
+* `Neutrophilspercent`
+* `APTT`
+* `CatHaematocrit`
+* `Platelets`
+* `BloodUreaNitrogen`
+* `Creatinine`
+* `Age`
+* `ChronicKidneyDisease1`
+* `ASTALTRatio`
+* `HB`
+* `TotalPrimarySigns`
+
+#### Loading data
+
+```{r best total load  data, cache = TRUE}
+dtrain_80 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         APTT,
+         CatHaematocrit,
+         Platelets,
+         BloodUreaNitrogen,
+         Creatinine,
+         Age,
+         ChronicKidneyDisease1,
+         ASTALTRatio,
+         HB,
+         TotalPrimarySigns) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> best_total_dtrain_80
+
+dtest_20 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         APTT,
+         CatHaematocrit,
+         Platelets,
+         BloodUreaNitrogen,
+         Creatinine,
+         Age,
+         ChronicKidneyDisease1,
+         ASTALTRatio,
+         HB,
+         TotalPrimarySigns) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> best_total_dtest_20
+
+```
+
+#### Model train
+
+```{r best_total model train, cache = TRUE}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+
+best_total_train_control = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all", # save losses across all models
+  classProbs = TRUE, # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+best_total_tune_grid = expand.grid(
+  nrounds = 5000,
+  max_depth = c(2, 4, 6, 8, 10),
+  eta=c(0.5, 0.3, 0.1, 0.07),
+  gamma = c(0, 0.01),
+  colsample_bytree=c(1, 0.5),
+  min_child_weight=1,
+  subsample=c(1, 0.5)
+)
+
+# Recode https://stackoverflow.com/a/44131491/9664743
+set.seed(0)
+best_total_caret_model = train(
+  x = as.matrix(best_total_dtrain_80 %>% select(-Outcome)),
+  y = best_total_dtrain_80$Outcome,
+  trControl = best_total_train_control,
+  tuneGrid = best_total_tune_grid,
+  metric= "ROC",
+  method = "xgbTree"
+)
+registerDoSEQ()
+
+best_total_caret_model$bestTune
+```
+
+```{r best total caret model save}
+saveRDS(best_total_caret_model, file="best_total_caret_train.model")
+```
+
+#### Model results
+
+##### AUC
+
+```{r best total auc, warning=T, echo=FALSE, cache = T}
+best_total_pred_prob <- predict(best_total_caret_model,
+                                as.matrix(best_total_dtest_20 %>% select(-Outcome)), type="prob")
+#plot((roc(response=best_total_dtest_20$Outcome, predictor=best_total_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=best_total_dtest_20$Outcome, predictor=best_total_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r best total predictive values, cache = T}
+best_total_pred <- predict(best_total_caret_model,
+                           as.matrix(best_total_dtest_20 %>% select(-Outcome)))
+confusionMatrix(data = best_total_pred,
+                reference = best_total_dtest_20$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r best_total predictive values w CIs, cache = T}
+confusionMatrix(data = factor(best_total_pred,levels=c("DEATH", "ALIVE")) , reference = factor(best_total_dtest_20$Outcome, levels=c("DEATH", "ALIVE")), positive = "DEATH", mode=c("sens_spec"))$table -> best_total_matrix_table
+epiR::epi.tests(best_total_matrix_table) -> best_total_epitests
+
+Sensitivity <- c(best_total_epitests$elements$se, best_total_epitests$elements$se.low, best_total_epitests$elements$se.up)
+Specificity <- c(best_total_epitests$elements$sp, best_total_epitests$elements$sp.low, best_total_epitests$elements$sp.up)
+`Positive Predictive Value` <- c(best_total_epitests$elements$ppv, best_total_epitests$elements$ppv.low, best_total_epitests$elements$ppv.up)
+`Negative Predictive Value` <- c(best_total_epitests$elements$npv, best_total_epitests$elements$npv.low, best_total_epitests$elements$npv.up)
+best_total_epitests_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(best_total_epitests_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+knitr::kable(best_total_epitests_df)
+```
+
+##### Variables importance
+
+```{r best total variable importance, echo=FALSE, cache=T}
+best_total_var_importance <- varImp(best_total_caret_model, scale = FALSE)
+plot(best_total_var_importance)
+```
+
+### Clinical model
+
+Independet variables:
+
+* `Age`
+* `PrimarySignFever1`
+* `PrimarySignMuscularpain`
+* `PrimarySignCough1`
+* `PrimarySignDecreasedconsciousnes`
+* `Respiratorydistress1`
+* `Cancer1`
+* `Cardiovasculardisease1`
+* `ChronicKidneyDisease1`
+* `Diabetes1`
+* `OtherLungDisease1`
+* `OtherChronicDisease1`
+
+#### Loading data
+
+```{r clinical load  data, cache = TRUE}
+dtrain_80 %>%
+  select(Outcome,
+         Age,
+         PrimarySignFever1,
+         PrimarySignMuscularpain,
+         PrimarySignCough1,
+         PrimarySignDecreasedconsciousnes,
+         Respiratorydistress1,
+         Cancer1,
+         Cardiovasculardisease1,
+         ChronicKidneyDisease1,
+         Diabetes1,
+         OtherLungDisease1,
+         OtherChronicDisease1) -> clinical_dtrain_80
+
+dtest_20 %>%
+  select(Outcome,
+         Age,
+         PrimarySignFever1,
+         PrimarySignMuscularpain,
+         PrimarySignCough1,
+         PrimarySignDecreasedconsciousnes,
+         Respiratorydistress1,
+         Cancer1,
+         Cardiovasculardisease1,
+         ChronicKidneyDisease1,
+         Diabetes1,
+         OtherLungDisease1,
+         OtherChronicDisease1) -> clinical_dtest_20
+
+```
+
+#### Model train
+
+```{r clinical model train, cache = TRUE}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+clinical_train_control = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all", # save losses across all models
+  classProbs = TRUE, # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+clinical_tune_grid = expand.grid(
+  nrounds = 5000,
+  max_depth = c(2, 4, 6, 8, 10),
+  eta=c(0.5, 0.3, 0.1, 0.07),
+  gamma = c(0, 0.01),
+  colsample_bytree=c(1, 0.5),
+  min_child_weight=1,
+  subsample=c(1, 0.5)
+)
+
+# Recode https://stackoverflow.com/a/44131491/9664743
+set.seed(0)
+clinical_caret_model = train(
+  x = as.matrix(clinical_dtrain_80 %>% select(-Outcome)),
+  y = clinical_dtrain_80$Outcome,
+  trControl = clinical_train_control,
+  tuneGrid = clinical_tune_grid,
+  metric= "ROC",
+  method = "xgbTree"
+)
+registerDoSEQ()
+clinical_caret_model$bestTune
+```
+
+```{r clinical care model save}
+saveRDS(clinical_caret_model, file="clinical_caret_train.model")
+```
+
+
+#### Model results
+
+##### AUC
+
+```{r clinical auc, warning=T, echo=FALSE, cache = T}
+clinical_pred_prob <- predict(clinical_caret_model,
+                                as.matrix(clinical_dtest_20 %>% select(-Outcome)), type="prob")
+#plot((roc(response=clinical_dtest_20$Outcome, predictor=clinical_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=clinical_dtest_20$Outcome, predictor=clinical_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r clinical predictive values, cache = T}
+clinical_pred <- predict(clinical_caret_model,
+                           as.matrix(clinical_dtest_20 %>% select(-Outcome)))
+confusionMatrix(data = clinical_pred,
+                reference = clinical_dtest_20$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r clinical predictive values w CIs, cache = T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(clinical_pred,levels=c("DEATH", "ALIVE")) , reference = factor(clinical_dtest_20$Outcome, levels=c("DEATH", "ALIVE")), positive = "DEATH", mode=c("sens_spec"))$table -> clinical_matrix_table
+epiR::epi.tests(clinical_matrix_table) -> clinical_epitests
+
+Sensitivity <- c(clinical_epitests$elements$se, clinical_epitests$elements$se.low, clinical_epitests$elements$se.up)
+Specificity <- c(clinical_epitests$elements$sp, clinical_epitests$elements$sp.low, clinical_epitests$elements$sp.up)
+`Positive Predictive Value` <- c(clinical_epitests$elements$ppv, clinical_epitests$elements$ppv.low, clinical_epitests$elements$ppv.up)
+`Negative Predictive Value` <- c(clinical_epitests$elements$npv, clinical_epitests$elements$npv.low, clinical_epitests$elements$npv.up)
+clinical_epitests_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(clinical_epitests_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+knitr::kable(clinical_epitests_df)
+```
+
+##### Variables importance
+
+```{r clinical variable importance, echo=FALSE, cache=T}
+clinical_var_importance <- varImp(clinical_caret_model, scale = FALSE)
+plot(clinical_var_importance)
+```
+
+### Third model
+
+Independet variables:
+
+* `PT`
+* `Neutrophilspercent`
+* `ASTALTRatio`
+* `APTT`
+* `CatHaematocrit`
+* `Platelets`
+* `BloodUreaNitrogen`
+* `Creatinine`
+* `Age`
+* `Cancer1`
+* `INR`
+* `CatHB`
+* `TotalPrimarySigns`
+* `CRP`
+
+
+#### Loading data
+
+```{r third_model load  data, cache = TRUE}
+dtrain_80 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         ASTALTRatio,
+         APTT,
+         CatHaematocrit,
+         Platelets,
+         BloodUreaNitrogen,
+         Creatinine,
+         Age,
+         Cancer1,
+         INR,
+         CatHB,
+         TotalPrimarySigns,
+         CRP) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit", "CatHB"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> third_model_dtrain_80
+
+dtest_20 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         ASTALTRatio,
+         APTT,
+         CatHaematocrit,
+         Platelets,
+         BloodUreaNitrogen,
+         Creatinine,
+         Age,
+         Cancer1,
+         INR,
+         CatHB,
+         TotalPrimarySigns,
+         CRP) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit", "CatHB"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> third_model_dtest_20
+
+```
+
+#### Model train
+
+```{r third_model model train, cache = TRUE}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+third_model_train_control = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all", # save losses across all models
+  classProbs = TRUE, # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+third_model_tune_grid = expand.grid(
+  nrounds = 5000,
+  max_depth = c(2, 4, 6, 8, 10),
+  eta=c(0.5, 0.3, 0.1, 0.07),
+  gamma = c(0, 0.01),
+  colsample_bytree=c(1, 0.5),
+  min_child_weight=1,
+  subsample=c(1, 0.5)
+)
+
+# Recode https://stackoverflow.com/a/44131491/9664743
+set.seed(0)
+third_model_caret_model = train(
+  x = as.matrix(third_model_dtrain_80 %>% select(-Outcome)),
+  y = third_model_dtrain_80$Outcome,
+  trControl = third_model_train_control,
+  tuneGrid = third_model_tune_grid,
+  metric= "ROC",
+  method = "xgbTree"
+)
+registerDoSEQ()
+third_model_caret_model$bestTune
+```
+
+```{r third_model care model save}
+saveRDS(third_model_caret_model, file="third_model_caret_train.model")
+```
+
+
+#### Model results
+
+##### AUC
+
+```{r third_model auc, warning=T, echo=FALSE, cache = T}
+third_model_pred_prob <- predict(third_model_caret_model,
+                                as.matrix(third_model_dtest_20 %>% select(-Outcome)), type="prob")
+#plot((roc(response=third_model_dtest_20$Outcome, predictor=third_model_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=third_model_dtest_20$Outcome, predictor=third_model_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r third_model predictive values, cache = T}
+third_model_pred <- predict(third_model_caret_model,
+                           as.matrix(third_model_dtest_20 %>% select(-Outcome)))
+confusionMatrix(data = third_model_pred,
+                reference = third_model_dtest_20$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r third_model predictive values w CIs, cache = T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(third_model_pred,levels=c("DEATH", "ALIVE")) , reference = factor(third_model_dtest_20$Outcome, levels=c("DEATH", "ALIVE")), positive = "DEATH", mode=c("sens_spec"))$table -> third_model_matrix_table
+epiR::epi.tests(third_model_matrix_table) -> third_model_epitests
+
+Sensitivity <- c(third_model_epitests$elements$se, third_model_epitests$elements$se.low, third_model_epitests$elements$se.up)
+Specificity <- c(third_model_epitests$elements$sp, third_model_epitests$elements$sp.low, third_model_epitests$elements$sp.up)
+`Positive Predictive Value` <- c(third_model_epitests$elements$ppv, third_model_epitests$elements$ppv.low, third_model_epitests$elements$ppv.up)
+`Negative Predictive Value` <- c(third_model_epitests$elements$npv, third_model_epitests$elements$npv.low, third_model_epitests$elements$npv.up)
+third_model_epitests_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(third_model_epitests_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+knitr::kable(third_model_epitests_df)
+```
+
+##### Variables importance
+
+```{r third_model variable importance, echo=FALSE, cache=T}
+third_model_var_importance <- varImp(third_model_caret_model, scale = FALSE)
+plot(third_model_var_importance)
+```
+
+### Total Stepwise model
+
+Independet variables:
+
+* `PT`
+* `Neutrophilspercent`
+* `Res`
+* `CatHaematocrit`
+* `Age`
+* `CRP`
+* `Respiratorydistress1`
+* `ASTALTRatio`
+* `APTT`
+* `BloodUreaNitrogen`
+
+
+#### Loading data
+
+```{r total_stepwise load  data, cache = TRUE}
+dtrain_80 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         Respiratorydistress1,
+         Cardiovasculardisease1,
+         Haematocrit,
+         Age,
+         CRP) -> total_stepwise_dtrain_80
+
+dtest_20 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         Respiratorydistress1,
+         Cardiovasculardisease1,
+         Haematocrit,
+         Age,
+         CRP) -> total_stepwise_dtest_20
+
+```
+
+#### Caret tuning
+
+```{r total_stepwise model train, cache = TRUE}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+total_stepwise_train_control = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all", # save losses across all models
+  classProbs = TRUE, # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+total_stepwise_tune_grid = expand.grid(
+  nrounds = 5000,
+  max_depth = c(2, 4, 6, 8, 10),
+  eta=c(0.5, 0.3, 0.1, 0.07),
+  gamma = c(0, 0.01),
+  colsample_bytree=c(1, 0.5),
+  min_child_weight=1,
+  subsample=c(1, 0.5)
+)
+
+# Recode https://stackoverflow.com/a/44131491/9664743
+set.seed(0)
+total_stepwise_caret_model = train(
+  x = as.matrix(total_stepwise_dtrain_80 %>% select(-Outcome)),
+  y = total_stepwise_dtrain_80$Outcome,
+  trControl = total_stepwise_train_control,
+  tuneGrid = total_stepwise_tune_grid,
+  metric= "ROC",
+  method = "xgbTree"
+)
+registerDoSEQ()
+total_stepwise_caret_model$bestTune
+```
+
+```{r total_stepwise care model save}
+saveRDS(total_stepwise_caret_model, file="total_stepwise_caret_train.model")
+```
+
+
+#### Model results
+
+##### AUC
+
+```{r total_stepwise auc, warning=T, echo=FALSE, cache = T}
+total_stepwise_pred_prob <- predict(total_stepwise_caret_model,
+                                as.matrix(total_stepwise_dtest_20 %>% select(-Outcome)), type="prob")
+#plot((roc(response=total_stepwise_dtest_20$Outcome, predictor=total_stepwise_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=total_stepwise_dtest_20$Outcome, predictor=total_stepwise_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r total_stepwise predictive values, cache = T}
+total_stepwise_pred <- predict(total_stepwise_caret_model,
+                           as.matrix(total_stepwise_dtest_20 %>% select(-Outcome)))
+confusionMatrix(data = total_stepwise_pred,
+                reference = total_stepwise_dtest_20$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r total_stepwise predictive values w CIs, cache = T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(total_stepwise_pred,levels=c("DEATH", "ALIVE")) , reference = factor(total_stepwise_dtest_20$Outcome, levels=c("DEATH", "ALIVE")), positive = "DEATH", mode=c("sens_spec"))$table -> total_stepwise_matrix_table
+epiR::epi.tests(total_stepwise_matrix_table) -> total_stepwise_epitests
+
+Sensitivity <- c(total_stepwise_epitests$elements$se, total_stepwise_epitests$elements$se.low, total_stepwise_epitests$elements$se.up)
+Specificity <- c(total_stepwise_epitests$elements$sp, total_stepwise_epitests$elements$sp.low, total_stepwise_epitests$elements$sp.up)
+`Positive Predictive Value` <- c(total_stepwise_epitests$elements$ppv, total_stepwise_epitests$elements$ppv.low, total_stepwise_epitests$elements$ppv.up)
+`Negative Predictive Value` <- c(total_stepwise_epitests$elements$npv, total_stepwise_epitests$elements$npv.low, total_stepwise_epitests$elements$npv.up)
+total_stepwise_epitests_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(total_stepwise_epitests_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+knitr::kable(total_stepwise_epitests_df)
+```
+
+##### Variables importance
+
+```{r total_stepwise variable importance, echo=FALSE, cache=T}
+total_stepwise_var_importance <- varImp(total_stepwise_caret_model, scale = FALSE)
+plot(total_stepwise_var_importance)
+```
+
+### Mixmodel model
+
+Independet variables:
+
+* `PT`
+* `Neutrophilspercent`
+* `lymphocytespercent`
+* `CatHaematocrit`
+* `Age`
+* `CRP`
+* `Respiratorydistress1`
+* `ASTALTRatio`
+* `APTT`
+* `BloodUreaNitrogen`
+
+
+#### Loading data
+
+```{r mixmodel load  data, cache = TRUE}
+dtrain_80 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         lymphocytespercent,
+         CatHaematocrit,
+         Age,
+         CRP,
+         Respiratorydistress1,
+         ASTALTRatio,
+         APTT,
+         BloodUreaNitrogen) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit", "CatHB"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> mixmodel_dtrain_80
+
+dtest_20 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         lymphocytespercent,
+         CatHaematocrit,
+         Age,
+         CRP,
+         Respiratorydistress1,
+         ASTALTRatio,
+         APTT,
+         BloodUreaNitrogen) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit", "CatHB"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> mixmodel_dtest_20
+
+```
+
+#### Model trains
+
+```{r mixmodel model train, cache = TRUE}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+mixmodel_train_control = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all", # save losses across all models
+  classProbs = TRUE, # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+mixmodel_tune_grid = expand.grid(
+  nrounds = 5000,
+  max_depth = c(2, 4, 6, 8, 10),
+  eta=c(0.5, 0.3, 0.1, 0.07),
+  gamma = c(0, 0.01),
+  colsample_bytree=c(1, 0.5),
+  min_child_weight=1,
+  subsample=c(1, 0.5)
+)
+
+# Recode https://stackoverflow.com/a/44131491/9664743
+set.seed(0)
+mixmodel_caret_model = train(
+  x = as.matrix(mixmodel_dtrain_80 %>% select(-Outcome)),
+  y = mixmodel_dtrain_80$Outcome,
+  trControl = mixmodel_train_control,
+  tuneGrid = mixmodel_tune_grid,
+  metric= "ROC",
+  method = "xgbTree"
+)
+registerDoSEQ()
+mixmodel_caret_model$bestTune
+```
+
+```{r mixmodel care model save}
+saveRDS(mixmodel_caret_model, file="mixmodel_caret_train.model")
+```
+
+
+#### Model results
+
+##### AUC
+
+```{r mixmodel auc, warning=T, echo=FALSE, cache = T}
+mixmodel_pred_prob <- predict(mixmodel_caret_model,
+                                as.matrix(mixmodel_dtest_20 %>% select(-Outcome)), type="prob")
+#plot((roc(response=mixmodel_dtest_20$Outcome, predictor=mixmodel_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=mixmodel_dtest_20$Outcome, predictor=mixmodel_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r mixmodel predictive values, cache = T}
+mixmodel_pred <- predict(mixmodel_caret_model,
+                           as.matrix(mixmodel_dtest_20 %>% select(-Outcome)))
+confusionMatrix(data = mixmodel_pred,
+                reference = mixmodel_dtest_20$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r mixmodel predictive values w CIs, cache = T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(mixmodel_pred,levels=c("DEATH", "ALIVE")) , reference = factor(mixmodel_dtest_20$Outcome, levels=c("DEATH", "ALIVE")), positive = "DEATH", mode=c("sens_spec"))$table -> mixmodel_matrix_table
+epiR::epi.tests(mixmodel_matrix_table) -> mixmodel_epitests
+
+Sensitivity <- c(mixmodel_epitests$elements$se, mixmodel_epitests$elements$se.low, mixmodel_epitests$elements$se.up)
+Specificity <- c(mixmodel_epitests$elements$sp, mixmodel_epitests$elements$sp.low, mixmodel_epitests$elements$sp.up)
+`Positive Predictive Value` <- c(mixmodel_epitests$elements$ppv, mixmodel_epitests$elements$ppv.low, mixmodel_epitests$elements$ppv.up)
+`Negative Predictive Value` <- c(mixmodel_epitests$elements$npv, mixmodel_epitests$elements$npv.low, mixmodel_epitests$elements$npv.up)
+mixmodel_epitests_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(mixmodel_epitests_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+knitr::kable(mixmodel_epitests_df)
+```
+
+##### Variables importance
+
+```{r mixmodel variable importance, echo=FALSE, cache=T}
+mixmodel_var_importance <- varImp(mixmodel_caret_model, scale = FALSE, dig=3)
+mixmodel_var_importance
+```
+
+
+```{r mixmodel variable importance plot, echo=FALSE, cache=T}
+
+## BloodUreaNitrogen    0.192687
+## ASTALTRatio          0.163023
+## Neutrophilspercent   0.135212
+## APTT                 0.132159
+## CRP                  0.111953
+## Age                  0.092079
+## lymphocytespercent   0.077785
+## PT                   0.072139
+## Respiratorydistress1 0.009341
+## CatHaematocrit_2     0.007466
+## CatHaematocrit_1     0.003401
+## CatHaematocrit_0     0.002753
+
+rownames(mixmodel_var_importance$importance) <- 
+  c("Blood Urea Nitrogen",
+    "AST/ALT Ratio",
+    "Neutrophils % ",
+    "APTT",
+    "CRP",
+    "Age",
+    "Lymphocytes %",
+    "PT",
+    "Respiratory distress",
+    "Haematocrit - More",
+    "Haematocrit - Normal",
+    "Haematocrit - Less")
+# plot(mixmodel_var_importance)
+ggplot(mixmodel_var_importance)
+```
+
+### Clinical Stepwise model
+
+Independet variables:
+
+* `PT`
+* `Neutrophilspercent`
+* `ASTALTRatio`
+* `APTT`
+* `CatHaematocrit`
+* `Platelets`
+* `BloodUreaNitrogen`
+* `Creatinine`
+* `Age`
+* `Cancer1`
+* `INR`
+* `CatHB`
+* `CRP`
+* `TotalPrimarySigns`
+
+
+#### Loading data
+
+```{r clinical_stepwise load  data, cache = TRUE}
+dtrain_80 %>%
+  select(Outcome,
+         SEX1,
+         Totalcommorbidities1,
+         Diabetes1,
+         PrimarySignCough1,
+         ChronicKidneyDisease1,
+         Respiratorydistress1) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("Diabetes1", "PrimarySignCough1", "ChronicKidneyDisease1", "Respiratorydistress1"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> clinical_stepwise_dtrain_80
+
+dtest_20 %>%
+  select(Outcome,
+         SEX1,
+         Totalcommorbidities1,
+         Diabetes1,
+         PrimarySignCough1,
+         ChronicKidneyDisease1,
+         Respiratorydistress1) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("Diabetes1", "PrimarySignCough1", "ChronicKidneyDisease1", "Respiratorydistress1"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> clinical_stepwise_dtest_20
+
+```
+
+#### Model train
+
+```{r clinical_stepwise model train, cache = TRUE}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+clinical_stepwise_train_control = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all", # save losses across all models
+  classProbs = TRUE, # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+clinical_stepwise_tune_grid = expand.grid(
+  nrounds = 5000,
+  max_depth = c(2, 4, 6, 8, 10),
+  eta=c(0.5, 0.3, 0.1, 0.07),
+  gamma = c(0, 0.01),
+  colsample_bytree=c(1, 0.5),
+  min_child_weight=1,
+  subsample=c(1, 0.5)
+)
+
+# Recode https://stackoverflow.com/a/44131491/9664743
+set.seed(0)
+clinical_stepwise_caret_model = train(
+  x = as.matrix(clinical_stepwise_dtrain_80 %>% select(-Outcome)),
+  y = clinical_stepwise_dtrain_80$Outcome,
+  trControl = clinical_stepwise_train_control,
+  tuneGrid = clinical_stepwise_tune_grid,
+  metric= "ROC",
+  method = "xgbTree"
+)
+registerDoSEQ()
+clinical_stepwise_caret_model$bestTune
+```
+
+```{r clinical_stepwise care model save}
+saveRDS(clinical_stepwise_caret_model, file="clinical_stepwise_caret_train.model")
+```
+
+#### Model results
+
+#### AUC
+
+```{r clinical_stepwise auc, warning=T, echo=FALSE, cache = T}
+clinical_stepwise_pred_prob <- predict(clinical_stepwise_caret_model,
+                                as.matrix(clinical_stepwise_dtest_20 %>% select(-Outcome)), type="prob")
+#plot((roc(response=clinical_stepwise_dtest_20$Outcome, predictor=clinical_stepwise_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=clinical_stepwise_dtest_20$Outcome, predictor=clinical_stepwise_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r clinical_stepwise predictive values, cache = T}
+clinical_stepwise_pred <- predict(clinical_stepwise_caret_model,
+                           as.matrix(clinical_stepwise_dtest_20 %>% select(-Outcome)))
+confusionMatrix(data = clinical_stepwise_pred,
+                reference = clinical_stepwise_dtest_20$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r clinical_stepwise predictive values w CIs, cache = T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(clinical_stepwise_pred,levels=c("DEATH", "ALIVE")) , reference = factor(clinical_stepwise_dtest_20$Outcome, levels=c("DEATH", "ALIVE")), positive = "DEATH", mode=c("sens_spec"))$table -> clinical_stepwise_matrix_table
+epiR::epi.tests(clinical_stepwise_matrix_table) -> clinical_stepwise_epitests
+
+Sensitivity <- c(clinical_stepwise_epitests$elements$se, clinical_stepwise_epitests$elements$se.low, clinical_stepwise_epitests$elements$se.up)
+Specificity <- c(clinical_stepwise_epitests$elements$sp, clinical_stepwise_epitests$elements$sp.low, clinical_stepwise_epitests$elements$sp.up)
+`Positive Predictive Value` <- c(clinical_stepwise_epitests$elements$ppv, clinical_stepwise_epitests$elements$ppv.low, clinical_stepwise_epitests$elements$ppv.up)
+`Negative Predictive Value` <- c(clinical_stepwise_epitests$elements$npv, clinical_stepwise_epitests$elements$npv.low, clinical_stepwise_epitests$elements$npv.up)
+clinical_stepwise_epitests_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(clinical_stepwise_epitests_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+knitr::kable(clinical_stepwise_epitests_df)
+```
+
+##### Variables importance
+
+```{r clinical_stepwise variable importance, echo=FALSE, cache=T}
+clinical_stepwise_var_importance <- varImp(clinical_stepwise_caret_model, scale = FALSE)
+plot(clinical_stepwise_var_importance)
+```
+
+### Full Clinical model
+
+Independet variables:
+
+select_columns = c("Diabetes1", "PrimarySignCough1", "ChronicKidneyDisease1", "Respiratorydistress1"), 
+
+* `Age`
+* `SEX1`
+* `PrimarySignFever1`
+* `PrimarySignMuscularpain`
+* `PrimarySignCough1`
+* `PrimarySignDecreasedconsciousnes`
+* `Respiratorydistress1`
+* `Cancer1`
+* `HIVAIDS1`
+* `Asthma1`
+* `ChrinicNeuorologicdisorder1`
+* `Cardiovasculardisease1`
+* `BloodChronicDisease1`
+* `ChronicKidneyDisease1`
+* `Diabetes1`
+* `OtherLungDisease1`
+* `contacthistoryCovid191`
+* `Totalcommorbidities1`
+
+#### Loading data
+
+```{r full_clinical load  data, cache = TRUE}
+dtrain_80 %>%
+  select(Outcome,
+         Age,
+          SEX1,
+          PrimarySignFever1,
+          PrimarySignMuscularpain,
+          PrimarySignCough1,
+          PrimarySignDecreasedconsciousnes,
+          Respiratorydistress1,
+          Cancer1,
+          HIVAIDS1,
+          Asthma1,
+          ChrinicNeuorologicdisorder1,
+          Cardiovasculardisease1,
+          BloodChronicDisease1,
+          ChronicKidneyDisease1,
+          Diabetes1,
+          OtherLungDisease1,
+          contacthistoryCovid191,
+          Totalcommorbidities1) -> full_clinical_dtrain_80
+
+dtest_20 %>%
+  select(Outcome,
+         Age,
+          SEX1,
+          PrimarySignFever1,
+          PrimarySignMuscularpain,
+          PrimarySignCough1,
+          PrimarySignDecreasedconsciousnes,
+          Respiratorydistress1,
+          Cancer1,
+          HIVAIDS1,
+          Asthma1,
+          ChrinicNeuorologicdisorder1,
+          Cardiovasculardisease1,
+          BloodChronicDisease1,
+          ChronicKidneyDisease1,
+          Diabetes1,
+          OtherLungDisease1,
+          contacthistoryCovid191,
+          Totalcommorbidities1) -> full_clinical_dtest_20
+
+```
+
+#### Model train
+
+```{r full_clinical model train, cache = TRUE}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+full_clinical_train_control = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all", # save losses across all models
+  classProbs = TRUE, # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+full_clinical_tune_grid = expand.grid(
+  nrounds = 5000,
+  max_depth = c(2, 4, 6, 8, 10),
+  eta=c(0.5, 0.3, 0.1, 0.07),
+  gamma = c(0, 0.01),
+  colsample_bytree=c(1, 0.5),
+  min_child_weight=1,
+  subsample=c(1, 0.5)
+)
+
+# Recode https://stackoverflow.com/a/44131491/9664743
+set.seed(0)
+full_clinical_caret_model = train(
+  x = as.matrix(full_clinical_dtrain_80 %>% select(-Outcome)),
+  y = full_clinical_dtrain_80$Outcome,
+  trControl = full_clinical_train_control,
+  tuneGrid = full_clinical_tune_grid,
+  metric= "ROC",
+  method = "xgbTree"
+)
+registerDoSEQ()
+full_clinical_caret_model$bestTune
+```
+
+```{r full_clinical care model save}
+saveRDS(full_clinical_caret_model, file="full_clinical_caret_train.model")
+```
+
+
+#### Model results
+
+##### AUC
+
+```{r full_clinical auc, warning=T, echo=FALSE, cache = T}
+full_clinical_pred_prob <- predict(full_clinical_caret_model,
+                                as.matrix(full_clinical_dtest_20 %>% select(-Outcome)), type="prob")
+#plot((roc(response=full_clinical_dtest_20$Outcome, predictor=full_clinical_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=full_clinical_dtest_20$Outcome, predictor=full_clinical_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r full_clinical predictive values, cache = T}
+full_clinical_pred <- predict(full_clinical_caret_model,
+                           as.matrix(full_clinical_dtest_20 %>% select(-Outcome)))
+confusionMatrix(data = full_clinical_pred,
+                reference = full_clinical_dtest_20$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r full_clinical predictive values w CIs, cache = T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(full_clinical_pred,levels=c("DEATH", "ALIVE")) , reference = factor(full_clinical_dtest_20$Outcome, levels=c("DEATH", "ALIVE")), positive = "DEATH", mode=c("sens_spec"))$table -> full_clinical_matrix_table
+epiR::epi.tests(full_clinical_matrix_table) -> full_clinical_epitests
+
+Sensitivity <- c(full_clinical_epitests$elements$se, full_clinical_epitests$elements$se.low, full_clinical_epitests$elements$se.up)
+Specificity <- c(full_clinical_epitests$elements$sp, full_clinical_epitests$elements$sp.low, full_clinical_epitests$elements$sp.up)
+`Positive Predictive Value` <- c(full_clinical_epitests$elements$ppv, full_clinical_epitests$elements$ppv.low, full_clinical_epitests$elements$ppv.up)
+`Negative Predictive Value` <- c(full_clinical_epitests$elements$npv, full_clinical_epitests$elements$npv.low, full_clinical_epitests$elements$npv.up)
+full_clinical_epitests_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(full_clinical_epitests_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+knitr::kable(full_clinical_epitests_df)
+```
+
+##### Variables importance
+
+```{r full_clinical variable importance, echo=FALSE, cache=T}
+full_clinical_var_importance <- varImp(full_clinical_caret_model, scale = FALSE)
+plot(full_clinical_var_importance)
+```
