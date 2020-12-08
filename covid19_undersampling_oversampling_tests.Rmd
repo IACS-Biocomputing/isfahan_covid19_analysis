@@ -1,0 +1,677 @@
+---
+title: "COVID-19 Analyses"
+output: html_document
+---
+
+```{r setup, include=FALSE, cache = TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(haven)
+
+library(caret)
+library(pROC)
+```
+
+##  Oversampling and undersampling exploration for MixModel{.tabset}
+
+Independet variables:
+
+* `PT`
+* `Neutrophilspercent`
+* `lymphocytespercent`
+* `CatHaematocrit`
+* `Age`
+* `CRP`
+* `Respiratorydistress1`
+* `ASTALTRatio`
+* `APTT`
+* `BloodUreaNitrogen`
+
+```{r full data loading, echo=FALSE, cache=TRUE}
+Farvadin_2 <- read_dta("fwdcovid19/15 Farvardin-2 dleted missing discharge date.dta", encoding = "windows-1256") %>% 
+  mutate (Outcome = as.factor(Outcome)) %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         lymphocytespercent,
+         CatHaematocrit,
+         Age,
+         CRP,
+         Respiratorydistress1,
+         ASTALTRatio,
+         APTT,
+         BloodUreaNitrogen) %>% 
+  # filter(complete.cases(.)) %>% 
+  mutate(Outcome = recode(Outcome, "0" = "ALIVE", "1" = "DEATH")) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit", "CatHB"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> Farvadin_2_full_data
+```
+
+
+### Reference model
+
+Train and test datasets created previoysly using `createDataPartition(as.factor(Farvadin_2$Outcome), p=0.80, list=FALSE)` 
+
+Train data (80%)
+
+```{r train data loading, echo=FALSE, cache = TRUE}
+dtrain_80 <- readRDS("Farvadin_2_train_80.Rda")  %>% 
+  mutate(Outcome = recode(Outcome, "0" = "ALIVE", "1" = "DEATH"))
+summary(dtrain_80$Outcome)
+```
+
+Test data (20%)
+
+```{r test data loading, echo=FALSE, warning = F, cache = TRUE}
+dtest_20 <- readRDS("Farvadin_2_test_20.Rda") %>% 
+  mutate(Outcome = recode(Outcome, "0" = "ALIVE", "1" = "DEATH"))
+summary(dtest_20$Outcome)
+```
+
+#### Loading data
+
+```{r mixmodel load  data, echo=FALSE, cache = TRUE}
+dtrain_80 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         lymphocytespercent,
+         CatHaematocrit,
+         Age,
+         CRP,
+         Respiratorydistress1,
+         ASTALTRatio,
+         APTT,
+         BloodUreaNitrogen) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit", "CatHB"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> mixmodel_dtrain_80
+
+dtest_20 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         lymphocytespercent,
+         CatHaematocrit,
+         Age,
+         CRP,
+         Respiratorydistress1,
+         ASTALTRatio,
+         APTT,
+         BloodUreaNitrogen) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit", "CatHB"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> mixmodel_dtest_20
+
+```
+
+#### Model trains
+
+```{r mixmodel model train, echo=FALSE, cache = TRUE}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+mixmodel_train_control = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all", # save losses across all models
+  classProbs = TRUE, # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+mixmodel_tune_grid = expand.grid(
+  nrounds = 5000,
+  max_depth = c(2, 4, 6, 8, 10),
+  eta=c(0.5, 0.3, 0.1, 0.07),
+  gamma = c(0, 0.01),
+  colsample_bytree=c(1, 0.5),
+  min_child_weight=1,
+  subsample=c(1, 0.5)
+)
+
+# Recode https://stackoverflow.com/a/44131491/9664743
+set.seed(0)
+mixmodel_caret_model = train(
+  x = as.matrix(mixmodel_dtrain_80 %>% select(-Outcome)),
+  y = mixmodel_dtrain_80$Outcome,
+  trControl = mixmodel_train_control,
+  tuneGrid = mixmodel_tune_grid,
+  metric= "ROC",
+  method = "xgbTree"
+)
+registerDoSEQ()
+mixmodel_caret_model$bestTune
+```
+
+```{r mixmodel care model save, echo=FALSE}
+saveRDS(mixmodel_caret_model, file="mixmodel_caret_train_20121204.model")
+```
+
+##### Variables importance
+
+```{r mixmodel variable importance, echo=FALSE, cache=T}
+mixmodel_var_importance <- varImp(mixmodel_caret_model, scale = FALSE, dig=3)
+mixmodel_var_importance
+```
+
+
+```{r mixmodel variable importance plot, echo=FALSE, cache=T}
+
+## BloodUreaNitrogen    0.19269
+## ASTALTRatio          0.16302
+## Neutrophilspercent   0.13521
+## APTT                 0.13216
+## CRP                  0.11195
+## Age                  0.09208
+## lymphocytespercent   0.07778
+## PT                   0.07214
+## Respiratorydistress1 0.00934
+## CatHaematocrit_2     0.00747
+## CatHaematocrit_1     0.00340
+## CatHaematocrit_0     0.00275
+
+rownames(mixmodel_var_importance$importance) <- 
+  c("Blood Urea Nitrogen",
+    "AST/ALT Ratio",
+    "Neutrophils % ",
+    "APTT",
+    "CRP",
+    "Age",
+    "Lymphocytes %",
+    "PT",
+    "Respiratory distress",
+    "Haematocrit - More",
+    "Haematocrit - Normal",
+    "Haematocrit - Less")
+# plot(mixmodel_var_importance)
+ggplot(mixmodel_var_importance)
+```
+
+#### Model results
+
+##### AUC
+
+```{r mixmodel auc, warning=T, echo=FALSE, cache = T}
+mixmodel_pred_prob <- predict(mixmodel_caret_model,
+                                as.matrix(mixmodel_dtest_20 %>% select(-Outcome)), type="prob")
+#plot((roc(response=mixmodel_dtest_20$Outcome, predictor=mixmodel_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=mixmodel_dtest_20$Outcome, predictor=mixmodel_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r mixmodel predictive values, echo=FALSE, cache = T}
+mixmodel_pred <- predict(mixmodel_caret_model,
+                           as.matrix(mixmodel_dtest_20 %>% select(-Outcome)))
+confusionMatrix(data = mixmodel_pred,
+                reference = mixmodel_dtest_20$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r mixmodel predictive values w CIs, echo=FALSE, cache = T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(mixmodel_pred,levels=c("DEATH", "ALIVE")) , reference = factor(mixmodel_dtest_20$Outcome, levels=c("DEATH", "ALIVE")), positive = "DEATH", mode=c("sens_spec"))$table -> mixmodel_matrix_table
+epiR::epi.tests(mixmodel_matrix_table) -> mixmodel_epitests
+
+Sensitivity <- c(mixmodel_epitests$elements$se, mixmodel_epitests$elements$se.low, mixmodel_epitests$elements$se.up)
+Specificity <- c(mixmodel_epitests$elements$sp, mixmodel_epitests$elements$sp.low, mixmodel_epitests$elements$sp.up)
+`Positive Predictive Value` <- c(mixmodel_epitests$elements$ppv, mixmodel_epitests$elements$ppv.low, mixmodel_epitests$elements$ppv.up)
+`Negative Predictive Value` <- c(mixmodel_epitests$elements$npv, mixmodel_epitests$elements$npv.low, mixmodel_epitests$elements$npv.up)
+mixmodel_epitests_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(mixmodel_epitests_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+knitr::kable(mixmodel_epitests_df)
+```
+
+### Oversampled model
+
+Train and test datasets created previoysly using `upSample` from `caret` package and the `createDataPartition(as.factor(Farvadin_2$Outcome), p=0.80, list=FALSE)` also from the `caret` package.
+
+Train data (80%)
+
+```{r oversampled train data loading, cache = TRUE}
+dtrain_over_80 <- readRDS("Farvadin_2_balanced_over_train_80.Rda")  %>% 
+  mutate(Outcome = recode(Outcome, "0" = "ALIVE", "1" = "DEATH"))
+summary(dtrain_over_80$Outcome)
+```
+
+Test data (20%)
+
+```{r oversampled test data loading, warning = F, cache = TRUE}
+dtest_over_20 <- readRDS("Farvadin_2_balanced_over_test_20.Rda") %>% 
+  mutate(Outcome = recode(Outcome, "0" = "ALIVE", "1" = "DEATH"))
+summary(dtest_over_20$Outcome)
+```
+
+#### Loading data
+
+```{r oversampled load  data, cache = TRUE}
+dtrain_over_80 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         lymphocytespercent,
+         CatHaematocrit,
+         Age,
+         CRP,
+         Respiratorydistress1,
+         ASTALTRatio,
+         APTT,
+         BloodUreaNitrogen) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit", "CatHB"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> mixmodel_dtrain_over_80
+
+dtest_over_20 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         lymphocytespercent,
+         CatHaematocrit,
+         Age,
+         CRP,
+         Respiratorydistress1,
+         ASTALTRatio,
+         APTT,
+         BloodUreaNitrogen) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit", "CatHB"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> mixmodel_dtest_over_20
+
+```
+
+#### Model trains
+
+```{r oversampled model train, cache = TRUE}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+mixmodel_over_train_control = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all", # save losses across all models
+  classProbs = TRUE, # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+mixmodel_over_tune_grid = expand.grid(
+  nrounds = 5000,
+  max_depth = c(2, 4, 6, 8, 10),
+  eta=c(0.5, 0.3, 0.1, 0.07),
+  gamma = c(0, 0.01),
+  colsample_bytree=c(1, 0.5),
+  min_child_weight=1,
+  subsample=c(1, 0.5)
+)
+
+# Recode https://stackoverflow.com/a/44131491/9664743
+set.seed(0)
+mixmodel_over_caret_model = train(
+  x = as.matrix(mixmodel_dtrain_over_80 %>% select(-Outcome)),
+  y = mixmodel_dtrain_over_80$Outcome,
+  trControl = mixmodel_over_train_control,
+  tuneGrid = mixmodel_over_tune_grid,
+  metric= "ROC",
+  method = "xgbTree"
+)
+registerDoSEQ()
+mixmodel_over_caret_model$bestTune
+```
+
+```{r oversampled care model save}
+saveRDS(mixmodel_over_caret_model, file="mixmodel_over_caret_train_20121204.model")
+```
+
+#### Variables importance
+
+```{r oversampled variable importance full data, echo=FALSE, cache=T}
+mixmodel_over_var_importance <- varImp(mixmodel_over_caret_model, scale = FALSE, dig=3)
+mixmodel_over_var_importance
+```
+
+
+```{r oversampled variable importance plot f, echo=FALSE, cache=T}
+## lymphocytespercent   0.155644
+## BloodUreaNitrogen    0.144569
+## APTT                 0.134912
+## Neutrophilspercent   0.127320
+## Age                  0.114644
+## ASTALTRatio          0.113001
+## CRP                  0.093424
+## PT                   0.073857
+## CatHaematocrit_0     0.016608
+## CatHaematocrit_2     0.013890
+## Respiratorydistress1 0.009435
+## CatHaematocrit_1     0.002696
+rownames(mixmodel_over_var_importance$importance) <- 
+  c("Lymphocytes %",
+    "Blood Urea Nitrogen",
+    "APTT",
+    "Neutrophils % ",
+    "Age",
+    "AST/ALT Ratio",
+    "CRP",
+    "PT",
+    "Haematocrit - Less",
+    "Haematocrit - More",
+    "Respiratory distress",
+    "Haematocrit - Normal")
+ggplot(mixmodel_over_var_importance)
+```
+
+#### Model results using oversample TEST set 
+
+##### AUC
+
+```{r oversampled auc, warning=T, echo=FALSE, cache = T}
+mixmodel_over_pred_prob <- predict(mixmodel_over_caret_model,
+                                as.matrix(mixmodel_dtest_over_20 %>% select(-Outcome)), type="prob")
+#plot((roc(response=mixmodel_dtest_20$Outcome, predictor=mixmodel_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=mixmodel_dtest_over_20$Outcome, predictor=mixmodel_over_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r oversampled predictive values, echo=FALSE, cache = T}
+mixmodel_over_pred <- predict(mixmodel_over_caret_model,
+                           as.matrix(mixmodel_dtest_over_20 %>% select(-Outcome)))
+confusionMatrix(data = mixmodel_over_pred,
+                reference = mixmodel_dtest_over_20$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r oversampled predictive values w CIs, echo=FALSE, cache = T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(mixmodel_over_pred,levels=c("DEATH", "ALIVE")) , reference = factor(mixmodel_dtest_over_20$Outcome, levels=c("DEATH", "ALIVE")), positive = "DEATH", mode=c("sens_spec"))$table -> mixmodel_over_matrix_table
+epiR::epi.tests(mixmodel_over_matrix_table) -> mixmodel_over_epitests
+
+Sensitivity <- c(mixmodel_over_epitests$elements$se, mixmodel_over_epitests$elements$se.low, mixmodel_over_epitests$elements$se.up)
+Specificity <- c(mixmodel_over_epitests$elements$sp, mixmodel_over_epitests$elements$sp.low, mixmodel_over_epitests$elements$sp.up)
+`Positive Predictive Value` <- c(mixmodel_over_epitests$elements$ppv, mixmodel_over_epitests$elements$ppv.low, mixmodel_over_epitests$elements$ppv.up)
+`Negative Predictive Value` <- c(mixmodel_over_epitests$elements$npv, mixmodel_over_epitests$elements$npv.low, mixmodel_over_epitests$elements$npv.up)
+mixmodel_epitests_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(mixmodel_epitests_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+knitr::kable(mixmodel_epitests_df)
+```
+
+#### Model results using all data 
+
+##### AUC
+
+```{r oversampled auc full data, warning=T, echo=FALSE, cache = T}
+mixmodel_over_full_data_pred_prob <- predict(mixmodel_over_caret_model,
+                                             as.matrix(Farvadin_2_full_data %>% select(-Outcome)), type="prob")
+#plot((roc(response=mixmodel_dtest_20$Outcome, predictor=mixmodel_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=Farvadin_2_full_data$Outcome, predictor=mixmodel_over_full_data_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r oversampled predictive values full data, echo=FALSE, cache = T}
+mixmodel_over_full_data_pred <- predict(mixmodel_over_caret_model,
+                                        as.matrix(Farvadin_2_full_data %>% select(-Outcome)))
+confusionMatrix(data = mixmodel_over_full_data_pred,
+                reference = Farvadin_2_full_data$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r oversampled predictive values w CIs full data, echo=FALSE, cache = T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(mixmodel_over_full_data_pred,levels=c("DEATH", "ALIVE")) ,
+                reference = factor(Farvadin_2_full_data$Outcome, levels=c("DEATH", "ALIVE")),
+                positive = "DEATH", mode=c("sens_spec"))$table -> mixmodel_over_full_data_matrix_table
+epiR::epi.tests(mixmodel_over_full_data_matrix_table) -> mixmodel_over_full_data_epitests
+
+Sensitivity <- c(mixmodel_over_full_data_epitests$elements$se, mixmodel_over_full_data_epitests$elements$se.low, mixmodel_over_full_data_epitests$elements$se.up)
+
+Specificity <- c(mixmodel_over_full_data_epitests$elements$sp, mixmodel_over_full_data_epitests$elements$sp.low, mixmodel_over_full_data_epitests$elements$sp.up)
+
+`Positive Predictive Value` <- c(mixmodel_over_full_data_epitests$elements$ppv, mixmodel_over_full_data_epitests$elements$ppv.low, mixmodel_over_full_data_epitests$elements$ppv.up)
+
+`Negative Predictive Value` <- c(mixmodel_over_full_data_epitests$elements$npv, mixmodel_over_full_data_epitests$elements$npv.low, mixmodel_over_full_data_epitests$elements$npv.up)
+
+mixmodel_epitests_full_data_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(mixmodel_epitests_full_data_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+
+knitr::kable(mixmodel_epitests_full_data_df)
+```
+
+### Undersample model
+
+Train and test datasets created previoysly using `downSample` from `caret` package and the `createDataPartition(as.factor(Farvadin_2$Outcome), p=0.80, list=FALSE)` also from the `caret` package.
+
+Train data (80%)
+
+```{r undersampled train data loading, echo=FALSE, cache = TRUE}
+dtrain_under_80 <- readRDS("Farvadin_2_balanced_under_train_80.Rda")  %>% 
+  mutate(Outcome = recode(Outcome, "0" = "ALIVE", "1" = "DEATH"))
+summary(dtrain_under_80$Outcome)
+```
+
+Test data (20%)
+
+```{r undersampled test data loading, echo=FALSE, warning = F, cache = TRUE}
+dtest_under_20 <- readRDS("Farvadin_2_balanced_under_test_20.Rda") %>% 
+  mutate(Outcome = recode(Outcome, "0" = "ALIVE", "1" = "DEATH"))
+summary(dtest_under_20$Outcome)
+```
+
+#### Loading data
+
+```{r undersampled load  data, echo=FALSE, cache = TRUE}
+dtrain_under_80 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         lymphocytespercent,
+         CatHaematocrit,
+         Age,
+         CRP,
+         Respiratorydistress1,
+         ASTALTRatio,
+         APTT,
+         BloodUreaNitrogen) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit", "CatHB"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> mixmodel_dtrain_under_80
+
+dtest_under_20 %>%
+  select(Outcome,
+         PT,
+         Neutrophilspercent,
+         lymphocytespercent,
+         CatHaematocrit,
+         Age,
+         CRP,
+         Respiratorydistress1,
+         ASTALTRatio,
+         APTT,
+         BloodUreaNitrogen) %>% 
+  # filter(complete.cases(.)) %>% 
+  fastDummies::dummy_columns(select_columns = c("CatHaematocrit", "CatHB"), 
+                             ignore_na = T,
+                             remove_selected_columns = T) -> mixmodel_dtest_under_20
+
+```
+
+#### Model trains
+
+```{r undersampled model train, echo=FALSE, cache = TRUE}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+mixmodel_under_train_control = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all", # save losses across all models
+  classProbs = TRUE, # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+mixmodel_under_tune_grid = expand.grid(
+  nrounds = 5000,
+  max_depth = c(2, 4, 6, 8, 10),
+  eta=c(0.5, 0.3, 0.1, 0.07),
+  gamma = c(0, 0.01),
+  colsample_bytree=c(1, 0.5),
+  min_child_weight=1,
+  subsample=c(1, 0.5)
+)
+
+# Recode https://stackoverflow.com/a/44131491/9664743
+set.seed(0)
+mixmodel_under_caret_model = train(
+  x = as.matrix(mixmodel_dtrain_under_80 %>% select(-Outcome)),
+  y = mixmodel_dtrain_under_80$Outcome,
+  trControl = mixmodel_under_train_control,
+  tuneGrid = mixmodel_under_tune_grid,
+  metric= "ROC",
+  method = "xgbTree"
+)
+registerDoSEQ()
+mixmodel_under_caret_model$bestTune
+```
+
+```{r undersampled care model save}
+saveRDS(mixmodel_under_caret_model, file="mixmodel_under_caret_train_20121204.model")
+```
+##### Variables importance
+
+```{r undersampled variable importance, echo=FALSE, cache=T}
+mixmodel_under_var_importance <- varImp(mixmodel_under_caret_model, scale = FALSE, dig=3)
+mixmodel_under_var_importance
+```
+
+
+```{r undersampled variable importance plot, echo=FALSE, cache=T}
+
+## Neutrophilspercent   0.35931
+## Age                  0.21193
+## BloodUreaNitrogen    0.15784
+## ASTALTRatio          0.09336
+## APTT                 0.06541
+## lymphocytespercent   0.04389
+## CRP                  0.03440
+## PT                   0.01741
+## CatHaematocrit_0     0.01351
+## Respiratorydistress1 0.00293
+## CatHaematocrit_2     0.00000
+## CatHaematocrit_1     0.00000
+
+rownames(mixmodel_under_var_importance$importance) <- 
+  c("Neutrophils % ",
+    "Age",
+    "Blood Urea Nitrogen",
+    "AST/ALT Ratio",
+    "APTT",
+    "Lymphocytes %",
+    "CRP",
+    "PT",
+    "Haematocrit - Less",
+    "Respiratory distress",
+    "Haematocrit - More",
+    "Haematocrit - Normal")
+# plot(mixmodel_var_importance)
+ggplot(mixmodel_under_var_importance)
+```
+
+#### Model results using oversample TEST set
+
+##### AUC
+
+```{r undersampled auc, warning=T, echo=FALSE, cache = T}
+mixmodel_under_pred_prob <- predict(mixmodel_under_caret_model,
+                                as.matrix(mixmodel_dtest_under_20 %>% select(-Outcome)), type="prob")
+#plot((roc(response=mixmodel_dtest_20$Outcome, predictor=mixmodel_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=mixmodel_dtest_under_20$Outcome, predictor=mixmodel_under_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r undersampled predictive values, echo=FALSE, cache = T}
+mixmodel_under_pred <- predict(mixmodel_under_caret_model,
+                           as.matrix(mixmodel_dtest_under_20 %>% select(-Outcome)))
+confusionMatrix(data = mixmodel_under_pred,
+                reference = mixmodel_dtest_under_20$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r undersampled predictive values w CIs, echo=FALSE, cache = T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(mixmodel_under_pred,levels=c("DEATH", "ALIVE")) , reference = factor(mixmodel_dtest_under_20$Outcome, levels=c("DEATH", "ALIVE")), positive = "DEATH", mode=c("sens_spec"))$table -> mixmodel_under_matrix_table
+epiR::epi.tests(mixmodel_under_matrix_table) -> mixmodel_under_epitests
+
+Sensitivity <- c(mixmodel_under_epitests$elements$se, mixmodel_under_epitests$elements$se.low, mixmodel_under_epitests$elements$se.up)
+Specificity <- c(mixmodel_under_epitests$elements$sp, mixmodel_under_epitests$elements$sp.low, mixmodel_under_epitests$elements$sp.up)
+`Positive Predictive Value` <- c(mixmodel_under_epitests$elements$ppv, mixmodel_under_epitests$elements$ppv.low, mixmodel_under_epitests$elements$ppv.up)
+`Negative Predictive Value` <- c(mixmodel_under_epitests$elements$npv, mixmodel_under_epitests$elements$npv.low, mixmodel_under_epitests$elements$npv.up)
+mixmodel_epitests_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(mixmodel_epitests_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+knitr::kable(mixmodel_epitests_df)
+```
+
+#### Model results using all data 
+
+##### AUC
+
+```{r undersampled auc full data, warning=T, echo=FALSE, cache = T}
+mixmodel_under_full_data_pred_prob <- predict(mixmodel_under_caret_model,
+                                             as.matrix(Farvadin_2_full_data %>% select(-Outcome)), type="prob")
+#plot((roc(response=mixmodel_dtest_20$Outcome, predictor=mixmodel_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=Farvadin_2_full_data$Outcome, predictor=mixmodel_under_full_data_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r undersampled predictive values full data, echo=FALSE, cache = T}
+mixmodel_under_full_data_pred <- predict(mixmodel_under_caret_model,
+                                        as.matrix(Farvadin_2_full_data %>% select(-Outcome)))
+confusionMatrix(data = mixmodel_under_full_data_pred,
+                reference = Farvadin_2_full_data$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r undersampled predictive values w CIs full data, echo=FALSE, cache = T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(mixmodel_under_full_data_pred,levels=c("DEATH", "ALIVE")) ,
+                reference = factor(Farvadin_2_full_data$Outcome, levels=c("DEATH", "ALIVE")),
+                positive = "DEATH", mode=c("sens_spec"))$table -> mixmodel_under_full_data_matrix_table
+epiR::epi.tests(mixmodel_under_full_data_matrix_table) -> mixmodel_under_full_data_epitests
+
+Sensitivity <- c(mixmodel_under_full_data_epitests$elements$se, mixmodel_under_full_data_epitests$elements$se.low, mixmodel_under_full_data_epitests$elements$se.up)
+
+Specificity <- c(mixmodel_under_full_data_epitests$elements$sp, mixmodel_under_full_data_epitests$elements$sp.low, mixmodel_under_full_data_epitests$elements$sp.up)
+
+`Positive Predictive Value` <- c(mixmodel_under_full_data_epitests$elements$ppv, mixmodel_under_full_data_epitests$elements$ppv.low, mixmodel_under_full_data_epitests$elements$ppv.up)
+
+`Negative Predictive Value` <- c(mixmodel_under_full_data_epitests$elements$npv, mixmodel_under_full_data_epitests$elements$npv.low, mixmodel_under_full_data_epitests$elements$npv.up)
+
+mixmodel_epitests_full_data_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(mixmodel_epitests_full_data_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+
+knitr::kable(mixmodel_epitests_full_data_df)
+```
