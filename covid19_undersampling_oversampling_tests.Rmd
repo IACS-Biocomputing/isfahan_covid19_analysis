@@ -3,7 +3,7 @@ title: "COVID-19 Analyses"
 output: html_document
 ---
 
-```{r setup, include=FALSE, cache = TRUE}
+```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 library(haven)
@@ -669,6 +669,214 @@ Specificity <- c(mixmodel_under_full_data_epitests$elements$sp, mixmodel_under_f
 `Positive Predictive Value` <- c(mixmodel_under_full_data_epitests$elements$ppv, mixmodel_under_full_data_epitests$elements$ppv.low, mixmodel_under_full_data_epitests$elements$ppv.up)
 
 `Negative Predictive Value` <- c(mixmodel_under_full_data_epitests$elements$npv, mixmodel_under_full_data_epitests$elements$npv.low, mixmodel_under_full_data_epitests$elements$npv.up)
+
+mixmodel_epitests_full_data_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(mixmodel_epitests_full_data_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+
+knitr::kable(mixmodel_epitests_full_data_df)
+```
+
+
+### Oversample ROSE model
+
+Train and test datasets created previoysly using `ROSE` from `ROSE` package and the `createDataPartition(as.factor(Farvadin_2$Outcome), p=0.80, list=FALSE)` also from the `caret` package.
+
+Train data (80%)
+
+```{r ROSE train data loading, echo=FALSE, cache=T}
+dtrain_ROSE_80 <- readRDS("Farvadin_2_balanced_ROSE_train_80.Rda")  %>% 
+  mutate(Outcome = recode(Outcome, "0" = "ALIVE", "1" = "DEATH"))
+summary(dtrain_ROSE_80$Outcome)
+```
+
+Test data (20%)
+
+```{r ROSE test data loading, echo=FALSE, warning = F, cache=T}
+dtest_ROSE_20 <- readRDS("Farvadin_2_balanced_ROSE_test_20.Rda") %>% 
+  mutate(Outcome = recode(Outcome, "0" = "ALIVE", "1" = "DEATH"))
+summary(dtest_ROSE_20$Outcome)
+```
+
+#### Loading data
+
+```{r ROSE load  data, echo=FALSE, cache=T}
+dtrain_ROSE_80 -> mixmodel_dtrain_ROSE_80
+dtest_ROSE_20 -> mixmodel_dtest_ROSE_20
+```
+
+#### Model trains
+
+```{r ROSE model train, echo=FALSE, cache=T}
+# https://github.com/rstudio/rstudio/issues/6692
+library(doParallel)
+no_cores <- detectCores() - 1
+# create the cluster for caret to use
+#cl <- makePSOCKcluster(no_cores)
+cl <- parallel::makeCluster(no_cores, setup_strategy = "sequential")
+registerDoParallel(cl)
+
+registerDoParallel(cl)
+mixmodel_ROSE_train_control = trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  returnData = FALSE,
+  returnResamp = "all", # save losses across all models
+  classProbs = TRUE, # set to TRUE for AUC to be computed
+  summaryFunction = twoClassSummary,
+  allowParallel = TRUE
+)
+
+mixmodel_ROSE_tune_grid = expand.grid(
+  nrounds = 5000,
+  max_depth = c(2, 4, 6, 8, 10),
+  eta=c(0.5, 0.3, 0.1, 0.07),
+  gamma = c(0, 0.01),
+  colsample_bytree=c(1, 0.5),
+  min_child_weight=1,
+  subsample=c(1, 0.5)
+)
+
+# Recode https://stackoverflow.com/a/44131491/9664743
+set.seed(0)
+mixmodel_ROSE_caret_model = train(
+  x = as.matrix(mixmodel_dtrain_ROSE_80 %>% 
+                   mutate_at(vars(matches(c("Cat","Respiratorydistress1"))), 
+                             function(x) as.numeric(as.character(x))) 
+                 %>% select(-Outcome)),
+  y = mixmodel_dtrain_ROSE_80$Outcome,
+  trControl = mixmodel_ROSE_train_control,
+  tuneGrid = mixmodel_ROSE_tune_grid,
+  metric= "ROC",
+  method = "xgbTree"
+)
+registerDoSEQ()
+mixmodel_ROSE_caret_model$bestTune
+```
+
+```{r ROSE care model save}
+saveRDS(mixmodel_ROSE_caret_model, file="mixmodel_ROSE_caret_train_20121204.model")
+```
+##### Variables importance
+
+```{r ROSE variable importance, echo=FALSE, cache=T}
+mixmodel_ROSE_var_importance <- varImp(mixmodel_ROSE_caret_model, scale = FALSE, dig=3)
+mixmodel_ROSE_var_importance
+```
+
+
+```{r ROSE variable importance plot, echo=FALSE, cache=T}
+
+## PT                   0.36791
+## Neutrophilspercent   0.11763
+## BloodUreaNitrogen    0.09194
+## APTT                 0.08906
+## ASTALTRatio          0.07562
+## CRP                  0.06195
+## Age                  0.05177
+## lymphocytespercent   0.04336
+## Respiratorydistress1 0.04020
+## CatHaematocrit_0     0.03106
+## CatHaematocrit_1     0.02951
+## CatHaematocrit_2     0.00000
+
+rownames(mixmodel_ROSE_var_importance$importance) <- 
+  c("PT",
+    "Neutrophils % ",
+    "Blood Urea Nitrogen",
+    "APTT",
+    "AST/ALT Ratio",
+    "CRP",
+    "Age",
+    "Lymphocytes %",
+    "Respiratory distress",
+    "Haematocrit - Less",
+    "Haematocrit - Normal",
+    "Haematocrit - More")
+# plot(mixmodel_var_importance)
+ggplot(mixmodel_ROSE_var_importance)
+```
+
+#### Model results using oversample TEST set
+
+##### AUC
+
+```{r ROSE auc, warning=T, echo=FALSE, cache=T}
+mixmodel_ROSE_pred_prob <- predict(mixmodel_ROSE_caret_model,
+                                as.matrix(mixmodel_dtest_ROSE_20 %>% 
+                                            mutate_at(vars(matches(c("Cat","Respiratorydistress1"))), 
+                                                      function(x) as.numeric(as.character(x))) 
+                                          %>% select(-Outcome)), type="prob")
+#plot((roc(response=mixmodel_dtest_20$Outcome, predictor=mixmodel_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=mixmodel_dtest_ROSE_20$Outcome, predictor=mixmodel_ROSE_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r ROSE predictive values, echo=FALSE, cache=T}
+mixmodel_ROSE_pred <- predict(mixmodel_ROSE_caret_model,
+                           as.matrix(mixmodel_dtest_ROSE_20 %>% 
+                                            mutate_at(vars(matches(c("Cat","Respiratorydistress1"))), 
+                                                      function(x) as.numeric(as.character(x))) 
+                                          %>% select(-Outcome)))
+confusionMatrix(data = mixmodel_ROSE_pred,
+                reference = mixmodel_dtest_ROSE_20$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r ROSE predictive values w CIs, echo=FALSE, cache=T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(mixmodel_ROSE_pred,levels=c("DEATH", "ALIVE")) , reference = factor(mixmodel_dtest_ROSE_20$Outcome, levels=c("DEATH", "ALIVE")), positive = "DEATH", mode=c("sens_spec"))$table -> mixmodel_ROSE_matrix_table
+epiR::epi.tests(mixmodel_ROSE_matrix_table) -> mixmodel_ROSE_epitests
+
+Sensitivity <- c(mixmodel_ROSE_epitests$elements$se, mixmodel_ROSE_epitests$elements$se.low, mixmodel_ROSE_epitests$elements$se.up)
+Specificity <- c(mixmodel_ROSE_epitests$elements$sp, mixmodel_ROSE_epitests$elements$sp.low, mixmodel_ROSE_epitests$elements$sp.up)
+`Positive Predictive Value` <- c(mixmodel_ROSE_epitests$elements$ppv, mixmodel_ROSE_epitests$elements$ppv.low, mixmodel_ROSE_epitests$elements$ppv.up)
+`Negative Predictive Value` <- c(mixmodel_ROSE_epitests$elements$npv, mixmodel_ROSE_epitests$elements$npv.low, mixmodel_ROSE_epitests$elements$npv.up)
+mixmodel_epitests_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
+colnames(mixmodel_epitests_df) <- c("Estimate", "Lower Interval", "Upper Interval")
+knitr::kable(mixmodel_epitests_df)
+```
+
+#### Model results using all data 
+
+##### AUC
+
+```{r ROSE auc full data, warning=T, echo=FALSE, cache=T}
+mixmodel_ROSE_full_data_pred_prob <- predict(mixmodel_ROSE_caret_model,
+                                             as.matrix(Farvadin_2_full_data %>% select(-Outcome)), type="prob")
+#plot((roc(response=mixmodel_dtest_20$Outcome, predictor=mixmodel_pred$DEATH)),print.thres="best", print.thres.best.method="closest.topleft")
+roc(response=Farvadin_2_full_data$Outcome, predictor=mixmodel_ROSE_full_data_pred_prob$DEATH, levels = c("ALIVE", "DEATH"), direction = c("<"))
+```
+
+##### Predictivy values
+```{r ROSE predictive values full data, echo=FALSE, cache=T}
+mixmodel_ROSE_full_data_pred <- predict(mixmodel_ROSE_caret_model,
+                                        as.matrix(Farvadin_2_full_data %>% select(-Outcome)))
+confusionMatrix(data = mixmodel_ROSE_full_data_pred,
+                reference = Farvadin_2_full_data$Outcome,
+                positive = "DEATH")
+```
+
+Confidence intervals of Sensitivity and Specificity (Note that Outcome + means 'DEATH')
+
+```{r ROSE predictive values w CIs full data, echo=FALSE, cache=T}
+library(epiR)
+options(digits = 3)
+confusionMatrix(data = factor(mixmodel_ROSE_full_data_pred,levels=c("DEATH", "ALIVE")) ,
+                reference = factor(Farvadin_2_full_data$Outcome, levels=c("DEATH", "ALIVE")),
+                positive = "DEATH", mode=c("sens_spec"))$table -> mixmodel_ROSE_full_data_matrix_table
+epiR::epi.tests(mixmodel_ROSE_full_data_matrix_table) -> mixmodel_ROSE_full_data_epitests
+
+Sensitivity <- c(mixmodel_ROSE_full_data_epitests$elements$se, mixmodel_ROSE_full_data_epitests$elements$se.low, mixmodel_ROSE_full_data_epitests$elements$se.up)
+
+Specificity <- c(mixmodel_ROSE_full_data_epitests$elements$sp, mixmodel_ROSE_full_data_epitests$elements$sp.low, mixmodel_ROSE_full_data_epitests$elements$sp.up)
+
+`Positive Predictive Value` <- c(mixmodel_ROSE_full_data_epitests$elements$ppv, mixmodel_ROSE_full_data_epitests$elements$ppv.low, mixmodel_ROSE_full_data_epitests$elements$ppv.up)
+
+`Negative Predictive Value` <- c(mixmodel_ROSE_full_data_epitests$elements$npv, mixmodel_ROSE_full_data_epitests$elements$npv.low, mixmodel_ROSE_full_data_epitests$elements$npv.up)
 
 mixmodel_epitests_full_data_df <- as.data.frame(rbind(Sensitivity, Specificity, `Positive Predictive Value`, `Negative Predictive Value`))
 colnames(mixmodel_epitests_full_data_df) <- c("Estimate", "Lower Interval", "Upper Interval")
